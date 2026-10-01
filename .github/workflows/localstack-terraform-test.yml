@@ -7,34 +7,94 @@ on:
 
   workflow_dispatch: {}
 
+# Cancel superseded runs on the same ref so only the newest commit is tested.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
   localstack-terraform-test:
     runs-on: ubuntu-latest
 
+    env:
+      # LocalStack requires an auth token to start (it exits with code 55
+      # without one). The token comes from the repository secret; the
+      # docker-compose.yml reads it via ${LOCALSTACK_AUTH_TOKEN}.
+      LOCALSTACK_AUTH_TOKEN: ${{ secrets.LOCALSTACK_AUTH_TOKEN }}
+
     steps:
     - uses: actions/checkout@v4
+
+    - name: Verify LocalStack auth token is configured
+      run: |
+        if [ -z "${LOCALSTACK_AUTH_TOKEN}" ]; then
+          echo "::error::LOCALSTACK_AUTH_TOKEN secret is not set."
+          echo "Generate a token at https://app.localstack.cloud and add it as a repository secret."
+          exit 1
+        fi
+        echo "Auth token is present (${#LOCALSTACK_AUTH_TOKEN} characters)."
 
     - name: Build and Start LocalStack Container
       run: |
         docker compose up -d
+
+    - name: Wait for LocalStack to become ready
+      run: |
+        echo "Waiting for LocalStack to serve on localhost:4566 ..."
+        for i in $(seq 1 40); do
+          if curl -sf --max-time 3 http://localhost:4566/_localstack/health >/dev/null; then
+            echo "LocalStack is ready after $((i * 3))s."
+            curl -s http://localhost:4566/_localstack/health | head -c 400
+            echo
+            exit 0
+          fi
+          # Fail fast if the container died (e.g. invalid or expired token).
+          if [ "$(docker inspect -f '{{.State.Running}}' localstack 2>/dev/null)" != "true" ]; then
+            echo "::error::LocalStack container is not running."
+            docker compose logs
+            exit 1
+          fi
+          sleep 3
+        done
+        echo "::error::LocalStack did not become ready in time."
+        docker compose logs
+        exit 1
 
     - name: Setup Terraform
       uses: hashicorp/setup-terraform@v3
       with:
         terraform_version: latest
 
-    - name: Run Terraform Init and Validation
+    - name: Terraform Format Check
+      run: terraform fmt --recursive --check
+
+    - name: Terraform Init and Validate
       run: |
-        terraform init
+        terraform init -input=false
         terraform validate
-        terraform fmt --recursive --check
-        terraform plan
+
+    - name: Terraform Plan
+      run: |
+        terraform plan -input=false
         terraform show
 
     - name: Run Terraform Test
-      run: |
-        terraform test
+      run: terraform test
 
     - name: Stop and Delete LocalStack Container
       if: always()
-      run: docker compose down
+      run: |
+        docker compose logs --no-color > localstack.log 2>&1 || true
+        docker compose down -v
+
+    - name: Upload LocalStack logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: localstack-logs
+        path: localstack.log
+        if-no-files-found: ignore
+        retention-days: 7
